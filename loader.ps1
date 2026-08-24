@@ -348,4 +348,8 @@ $result = [ReflectiveExeLoader]::LoadAndRun($exeBytes, $cmdLine)
 
 if ($result -eq 0) { Write-Host "[+] success" } else { Write-Host "[-] exit code $result" }
 
+# kill host powershell — mapped exe runs on a non-primary thread so its exit()
+# only ends the thread, not us. terminate explicitly.
+[Environment]::Exit($result)
+
 
